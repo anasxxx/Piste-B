@@ -1,0 +1,279 @@
+import io, os, sys, json, time, uuid, tempfile, subprocess, logging
+from pathlib import Path
+from typing import Dict, Any, Optional, Tuple, List
+
+import numpy as np
+from PIL import Image, ImageOps, ImageFilter
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import requests
+
+# Pre/post utilities
+import cv2
+from rembg import remove as rembg_remove
+import trimesh
+from skimage import measure
+
+# ------------------------
+# Load config & prepare IO
+# ------------------------
+CFG_PATH = Path(os.getcwd()) / "config.yaml"
+try:
+    import yaml
+    with open(CFG_PATH, "r") as f:
+        CFG = yaml.safe_load(f) or {}
+except Exception:
+    CFG = {}
+
+ART_DIR = Path(CFG.get("artifacts_dir", "./outputs"))
+ART_DIR.mkdir(parents=True, exist_ok=True)
+
+TRIPOSR_API = CFG.get("triposr", {}).get("api_base", "http://127.0.0.1:8001")
+TRIPOSR_CLI = Path(CFG.get("triposr", {}).get("cli_runpy", str(Path.home()/"TripoSR/run.py")))
+
+IMG_RES   = int(CFG.get("model_config", {}).get("input_resolution", 1024))
+MC_RES    = int(CFG.get("model_config", {}).get("mc_resolution", 384))
+TEX_RES   = int(CFG.get("model_config", {}).get("texture_resolution", 1024))
+BAKE_TEX  = bool(CFG.get("model_config", {}).get("bake_texture", True))
+
+PREP = CFG.get("preprocess", {"enabled": True})
+POST = CFG.get("postprocess", {"enabled": True})
+
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+log = logging.getLogger("piste-b")
+
+app = FastAPI(title="Piste-B Gateway", version="1.0")
+
+# ------------------------
+# Image pre-processing
+# ------------------------
+def _ensure_pil(img: Image.Image) -> Image.Image:
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGB")
+    return img
+
+def preprocess_image(in_path: Path, out_dir: Path, target: int = 1024,
+                     pad_ratio: float = 0.12, bg_value: int = 128) -> Tuple[Path, Path]:
+    """
+    Returns (processed_png_path, mask_png_path)
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    img = Image.open(in_path).convert("RGB")
+
+    # 1) remove background (alpha matte)
+    rgba = rembg_remove(img)
+    if rgba.mode != "RGBA":
+        rgba = rgba.convert("RGBA")
+    alpha = np.array(rgba.split()[-1])
+
+    # 2) hard binary mask (clean)
+    thr = int(255 * float(PREP.get("mask_threshold", 0.8)))
+    mask = (alpha >= thr).astype(np.uint8) * 255
+
+    # morphology: close -> fill gaps
+    k = int(PREP.get("morph_kernel", 7))
+    kernel = np.ones((k, k), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    # 3) tight bbox
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        # fallback to original
+        bbox = (0, 0, img.width, img.height)
+    else:
+        xmin, xmax = xs.min(), xs.max()
+        ymin, ymax = ys.min(), ys.max()
+        # padding
+        pw = int((xmax - xmin + 1) * pad_ratio)
+        ph = int((ymax - ymin + 1) * pad_ratio)
+        xmin = max(0, xmin - pw); xmax = min(img.width  - 1, xmax + pw)
+        ymin = max(0, ymin - ph); ymax = min(img.height - 1, ymax + ph)
+        bbox = (xmin, ymin, xmax+1, ymax+1)
+
+    img_c = img.crop(bbox)
+    mask_c = Image.fromarray(mask).crop(bbox)
+
+    # 4) resize with padding to square canvas target x target
+    w, h = img_c.size
+    scale = target / max(w, h)
+    new_w, new_h = int(round(w*scale)), int(round(h*scale))
+    img_r = img_c.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    mask_r = mask_c.resize((new_w, new_h), Image.Resampling.NEAREST)
+
+    canvas = Image.new("RGB", (target, target), (bg_value, bg_value, bg_value))
+    mx = (target - new_w)//2
+    my = (target - new_h)//2
+    canvas.paste(img_r, (mx, my))
+    mask_canvas = Image.new("L", (target, target), 0)
+    mask_canvas.paste(mask_r, (mx, my))
+
+    out_img = out_dir / "input_preprocessed.png"
+    out_msk = out_dir / "input_mask.png"
+    canvas.save(out_img, "PNG")
+    mask_canvas.save(out_msk, "PNG")
+    return out_img, out_msk
+
+# ------------------------
+# Mesh post-processing
+# ------------------------
+def postprocess_mesh(in_obj: Path, out_obj: Path,
+                     drop_small: int = 600,  # faces
+                     smooth_iter: int = 10):
+    """
+    Clean small islands, fix normals/holes, Taubin smoothing.
+    """
+    mesh = trimesh.load(in_obj, force="mesh")
+    if isinstance(mesh, trimesh.Scene):
+        mesh = trimesh.util.concatenate(tuple(m for m in mesh.geometry.values() if isinstance(m, trimesh.Trimesh)))
+
+    # split & filter small comps
+    parts = mesh.split(only_watertight=False)
+    parts = [p for p in parts if len(p.faces) >= drop_small]
+    if not parts:
+        parts = [mesh]
+    mesh = trimesh.util.concatenate(parts)
+
+    # basic repairs
+    trimesh.repair.fix_inversion(mesh)
+    trimesh.repair.fix_normals(mesh)
+    try:
+        trimesh.repair.fill_holes(mesh)
+    except Exception:
+        pass
+
+    # Taubin smoothing (gentle)
+    try:
+        trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=0.53, iterations=smooth_iter)
+    except Exception:
+        pass
+
+    mesh.export(out_obj)
+
+# ------------------------
+# TripoSR runners
+# ------------------------
+def _try_triposr_api(img_path: Path, bake: bool, tex_res: int, mc_res: int, timeout=600) -> Dict[str, Any]:
+    url = f"{TRIPOSR_API.rstrip('/')}/generate"
+    files = {
+        "file": (img_path.name, open(img_path, "rb"), "image/png")
+    }
+    data = {
+        "bake_texture": str(bake).lower(),
+        "texture_resolution": str(tex_res),
+        "mc_resolution": str(mc_res)
+    }
+    r = requests.post(url, files=files, data=data, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+def _run_triposr_cli(img_path: Path, out_dir: Path, bake: bool, tex_res: int, mc_res: int) -> Dict[str, Any]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    # evite l’avertissement CUDA d’onnxruntime via rembg
+    env["REMBG_SESSION_PROVIDERS"] = env.get("REMBG_SESSION_PROVIDERS", "CPUExecutionProvider")
+
+    cmd = [
+        sys.executable, str(TRIPOSR_CLI),
+        str(img_path),
+        "--output-dir", str(out_dir),
+        "--mc-resolution", str(mc_res),
+    ]
+    if bake:
+        cmd += ["--bake-texture", "--texture-resolution", str(tex_res)]
+
+    cp = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    success = (cp.returncode == 0)
+    # trouve dossier output le plus récent
+    folders = sorted([p for p in out_dir.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True)
+    job_dir = folders[0] if folders else out_dir
+
+    assets = {
+        "mesh_obj": str(job_dir/"mesh.obj") if (job_dir/"mesh.obj").exists() else None,
+        "mesh_mtl": str(job_dir/"mesh.mtl") if (job_dir/"mesh.mtl").exists() else None,
+        "albedo_png": str(job_dir/"albedo.png") if (job_dir/"albedo.png").exists() else None,
+        "input_png": str(job_dir/"input.png") if (job_dir/"input.png").exists() else str(img_path),
+    }
+    log_tail = (cp.stdout + "\n" + cp.stderr).splitlines()[-50:]
+    return {"success": success, "job_dir": str(job_dir), "assets": assets, "log_tail": log_tail}
+
+# ------------------------
+# FastAPI endpoints
+# ------------------------
+@app.get("/health")
+def health():
+    return {"ok": True, "triposr_api": TRIPOSR_API, "cli": str(TRIPOSR_CLI)}
+
+@app.post("/generate")
+async def generate(
+    file: UploadFile = File(...),
+    bake_texture: bool = Form(BAKE_TEX),
+    texture_resolution: int = Form(TEX_RES),
+    mc_resolution: int = Form(MC_RES),
+):
+    t0 = time.time()
+    job_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
+    job_dir = ART_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_path = job_dir / file.filename
+    with open(raw_path, "wb") as f:
+        f.write(await file.read())
+
+    # 1) preprocess
+    proc_path = raw_path
+    mask_path = None
+    if PREP.get("enabled", True):
+        try:
+            proc_path, mask_path = preprocess_image(
+                raw_path, job_dir,
+                target=int(PREP.get("target", IMG_RES)),
+                pad_ratio=float(PREP.get("pad_ratio", 0.12)),
+                bg_value=int(PREP.get("bg_value", 128)),
+            )
+        except Exception as e:
+            log.warning(f"Preprocess failed, fallback to raw image: {e}")
+
+    # 2) try TripoSR API, else CLI
+    assets = {}
+    log_tail: List[str] = []
+    try:
+        resp = _try_triposr_api(proc_path, bake_texture, texture_resolution, mc_resolution)
+        if not resp.get("success"):
+            raise RuntimeError("TripoSR API returned success=false")
+        assets = resp.get("assets", {})
+        log_tail = resp.get("log_tail", [])
+        job_path = Path(resp.get("job_dir", str(job_dir)))
+    except Exception as e:
+        log.info(f"TripoSR API not available or failed: {e} -> fallback CLI")
+        cli_out = _run_triposr_cli(proc_path, job_dir, bake_texture, texture_resolution, mc_resolution)
+        assets = cli_out.get("assets", {})
+        log_tail = cli_out.get("log_tail", [])
+        job_path = Path(cli_out.get("job_dir", str(job_dir)))
+
+    # 3) postprocess mesh
+    mesh_in = Path(assets.get("mesh_obj") or "")
+    if POST.get("enabled", True) and mesh_in.exists():
+        mesh_pp = job_path / "mesh_post.obj"
+        try:
+            postprocess_mesh(
+                mesh_in, mesh_pp,
+                drop_small=int(POST.get("drop_small_faces", 600)),
+                smooth_iter=int(POST.get("smooth_iter", 10)),
+            )
+            assets["mesh_obj"] = str(mesh_pp)
+        except Exception as e:
+            log.warning(f"Postprocess failed: {e}")
+
+    # 4) mirror/copy paths out
+    elapsed = time.time() - t0
+    return JSONResponse({
+        "success": bool(assets.get("mesh_obj")),
+        "elapsed_sec": round(elapsed, 3),
+        "job_dir": str(job_path),
+        "assets": assets,
+        "note": "pre/post enabled: "
+                f"{PREP.get('enabled', True)}/{POST.get('enabled', True)}",
+        "log_tail": log_tail[-30:],
+    })

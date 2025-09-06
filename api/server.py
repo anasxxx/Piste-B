@@ -1,244 +1,311 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-API Fashion3D (Piste B)
-- /health   : statut & diagnostic
-- /generate : prend une image 2D et retourne un mesh 3D (via TripoSR)
-
-Stratégie:
-1) Essayer d'appeler l'API TripoSR (http://127.0.0.1:8001/generate)
-2) Si indisponible, lancer TripoSR localement via ~/TripoSR/run.py
-"""
-
-from __future__ import annotations
-import os, io, sys, json, time, uuid, shutil, tempfile, subprocess, typing as T
+import os, io, time, json, tempfile, subprocess, logging, sys
+from typing import Optional, Tuple
 from pathlib import Path
 
-# --- FastAPI ---
+import requests
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from PIL import Image
 
-# --- YAML (config) ---
+# Import fallback generator
 try:
-    import yaml
-except Exception as e:  # pragma: no cover
-    yaml = None
+    from fallback_generator import generate_fallback_mesh
+    FALLBACK_AVAILABLE = True
+except ImportError:
+    FALLBACK_AVAILABLE = False
 
-# --- HTTP client (optionnel) ---
-try:
-    import requests
-except Exception:
-    requests = None
-
-APP = FastAPI(
-    title="Fashion3D API (Piste B)",
-    version="1.0.0",
-    description="Passerelle vers TripoSR (API locale ou fallback en exécution locale).",
+# -------------------------------------------------------------------
+# Logging Setup
+# -------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('fashion3d_debug.log')
+    ]
 )
+logger = logging.getLogger("fashion3d")
 
-# -----------------------------------------------------------------------------
-# Chargement config (facultatif)
-# -----------------------------------------------------------------------------
-CWD = Path(os.getcwd())
-CFG_PATH = CWD / "config.yaml"
-CFG: dict = {}
-if CFG_PATH.is_file() and yaml is not None:
-    with CFG_PATH.open("r", encoding="utf-8") as f:
-        CFG = yaml.safe_load(f) or {}
-
-ART_DIR = Path(CFG.get("artifacts_dir", "./outputs")).resolve()
-TRIPOSR_API = os.environ.get("TRIPOSR_API", CFG.get("triposr_api", "http://127.0.0.1:8001"))
-TRIPOSR_REPO = Path(os.path.expanduser(CFG.get("triposr_repo", "~/TripoSR"))).resolve()
-
-# Assure le répertoire d’artefacts
+# -------------------------------------------------------------------
+# Config
+# -------------------------------------------------------------------
+ART_DIR = Path(os.getenv("F3D_ARTIFACTS_DIR", "outputs")).resolve()
 ART_DIR.mkdir(parents=True, exist_ok=True)
 
-# -----------------------------------------------------------------------------
-# Modèles / réponses
-# -----------------------------------------------------------------------------
-class GenerateResponse(BaseModel):
-    success: bool
-    message: str
-    job_dir: str | None = None
-    assets: dict = {}
-    log_tail: T.List[str] | None = None
+MICRO_URL = os.getenv("TRIPOSR_URL", "http://127.0.0.1:8001")  # micro-API
+RUNPY = Path.home() / "TripoSR" / "run.py"                     # fallback CLI
 
+app = FastAPI(title="Fashion3D Gateway")
 
-# -----------------------------------------------------------------------------
-# Utilitaires
-# -----------------------------------------------------------------------------
-def _now_ts() -> str:
-    return time.strftime("%Y%m%d-%H%M%S")
+logger.info(f"Fashion3D API starting...")
+logger.info(f"Artifacts dir: {ART_DIR}")
+logger.info(f"TripoSR micro API: {MICRO_URL}")
+logger.info(f"TripoSR CLI path: {RUNPY}")
+logger.info(f"TripoSR CLI exists: {RUNPY.exists()}")
+logger.info(f"Fallback generator available: {FALLBACK_AVAILABLE}")
 
-def _job_dir(base: Path) -> Path:
-    uid = f"{_now_ts()}-{uuid.uuid4().hex[:8]}"
-    d = base / "output_api" / uid
-    (d / "0").mkdir(parents=True, exist_ok=True)
-    return d
+def _now_jobdir() -> Path:
+    j = ART_DIR / time.strftime("%Y%m%d-%H%M%S")
+    j.mkdir(parents=True, exist_ok=True)
+    (j / "0").mkdir(parents=True, exist_ok=True)
+    logger.info(f"Created job directory: {j}")
+    return j
 
-def _tail_text_file(path: Path, n: int = 80) -> T.List[str]:
-    """Retourne les n dernières lignes d'un fichier texte si présent."""
-    if not path or not path.exists() or not path.is_file():
-        return []
+def _save_upload_to_png(f: UploadFile, dst_png: Path) -> None:
+    logger.info(f"Saving upload to: {dst_png}")
+    data = f.file.read()
+    if not data:
+        logger.error("Empty file uploaded")
+        raise HTTPException(400, "Empty file")
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    img.save(dst_png)
+    logger.info(f"Saved image: {dst_png.stat().st_size} bytes")
+
+def _try_micro_api(img_path: Path,
+                   bake_texture: bool,
+                   texture_resolution: int,
+                   mc_resolution: int,
+                   supersample: int) -> Tuple[bool, dict]:
+    """Return (ok, payload)."""
+    logger.info(f"Trying micro API at {MICRO_URL}")
+    url = f"{MICRO_URL.rstrip('/')}/generate"
+    files = {
+        "file": (img_path.name, open(img_path, "rb"), "image/png")
+    }
+    data = {
+        "bake_texture": str(bake_texture).lower(),
+        "texture_resolution": str(texture_resolution),
+        "mc_resolution": str(mc_resolution),
+        "supersample": str(supersample),
+    }
     try:
-        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        return lines[-n:]
-    except Exception:
-        return []
+        logger.info(f"POST {url} with data: {data}")
+        r = requests.post(url, files=files, data=data, timeout=600)
+        logger.info(f"Micro API response: {r.status_code}")
+        ok = 200 <= r.status_code < 300
+        payload = r.json() if r.headers.get("content-type","").startswith("application/json") else {"text": r.text, "status": r.status_code}
+        if not ok:
+            logger.error(f"Micro API failed: {payload}")
+        return ok, payload
+    except Exception as e:
+        logger.error(f"Micro API exception: {type(e).__name__}: {e}")
+        return False, {"error": f"{type(e).__name__}: {e}"}
 
-def _api_available() -> bool:
-    if requests is None:
-        return False
-    try:
-        r = requests.get(f"{TRIPOSR_API}/health", timeout=1.2)
-        return r.ok
-    except Exception:
-        return False
-
-def _call_triposr_api(img_path: Path, bake_texture: bool, texture_res: int, mc_res: int) -> dict:
-    if requests is None:
-        raise RuntimeError("Le module 'requests' n'est pas installé.")
-    with img_path.open("rb") as f:
-        files = {"file": (img_path.name, f, "image/*")}
-        data = {
-            "bake_texture": str(bake_texture).lower(),  # FastAPI accepte 'true'/'false'
-            "texture_resolution": str(texture_res),
-            "mc_resolution": str(mc_res),
-        }
-        url = f"{TRIPOSR_API}/generate"
-        r = requests.post(url, files=files, data=data, timeout=60)
-        r.raise_for_status()
-        return r.json()
-
-def _run_triposr_local(img_path: Path, bake_texture: bool, texture_res: int, mc_res: int, job_root: Path) -> dict:
-    """
-    Lance ~/TripoSR/run.py en sous-processus.
-    Ecrit les sorties dans job_root/0/ (mesh.obj, mesh.mtl, albedo.png, input.png)
-    """
-    run_py = TRIPOSR_REPO / "run.py"
-    if not run_py.is_file():
-        raise RuntimeError(f"TripoSR introuvable: {run_py}")
-
-    out_dir = job_root
+def _run_cli(img_path: Path,
+             outdir: Path,
+             bake_texture: bool,
+             texture_resolution: int,
+             mc_resolution: int) -> Tuple[bool, str]:
+    """Run ~/TripoSR/run.py as a fallback and capture stdout/stderr."""
+    logger.info(f"Running TripoSR CLI fallback")
+    logger.info(f"Input image: {img_path}")
+    logger.info(f"Output dir: {outdir}")
+    logger.info(f"TripoSR script: {RUNPY}")
+    
+    if not RUNPY.exists():
+        error_msg = f"TripoSR script not found at {RUNPY}"
+        logger.error(error_msg)
+        return False, error_msg
+    
     cmd = [
-        sys.executable or "python3",
-        str(run_py),
+        "python3", str(RUNPY),
         str(img_path),
-        "--output-dir", str(out_dir),
-        "--mc-resolution", str(mc_res),
+        "--output-dir", str(outdir),
+        "--mc-resolution", str(mc_resolution),
     ]
     if bake_texture:
-        cmd += ["--bake-texture", "--texture-resolution", str(texture_res)]
+        cmd += ["--bake-texture", "--texture-resolution", str(texture_resolution)]
 
-    log_file = out_dir / "stderr_stdout.log"
-    with log_file.open("w", encoding="utf-8") as lf:
-        proc = subprocess.run(cmd, stdout=lf, stderr=lf, cwd=str(TRIPOSR_REPO))
+    logger.info(f"CLI command: {' '.join(cmd)}")
+    
+    try:
+        proc = subprocess.Popen(
+            cmd, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.STDOUT, 
+            text=True,
+            cwd=RUNPY.parent  # Run from TripoSR directory
+        )
+        log = []
+        for line in proc.stdout:  # stream logs
+            line = line.rstrip()
+            log.append(line)
+            logger.info(f"TripoSR: {line}")
+        
+        code = proc.wait()
+        logger.info(f"TripoSR CLI finished with code: {code}")
+        return code == 0, "\n".join(log)
+    except Exception as e:
+        error_msg = f"CLI execution failed: {type(e).__name__}: {e}"
+        logger.error(error_msg)
+        return False, error_msg
 
-    # Assets attendus
-    bundle = out_dir / "0"
-    mesh_obj = bundle / "mesh.obj"
-    mesh_mtl = bundle / "mesh.mtl"
-    albedo   = bundle / "albedo.png"
-    input_png= bundle / "input.png"
+def _run_fallback_generator(img_path: Path,
+                           outdir: Path,
+                           bake_texture: bool,
+                           texture_resolution: int,
+                           mc_resolution: int) -> Tuple[bool, str]:
+    """Use our custom fallback mesh generator"""
+    logger.info(f"Running fallback mesh generator")
+    
+    if not FALLBACK_AVAILABLE:
+        error_msg = "Fallback generator not available"
+        logger.error(error_msg)
+        return False, error_msg
+    
+    try:
+        output_dir = outdir / "0"
+        assets = generate_fallback_mesh(
+            img_path=img_path,
+            output_dir=output_dir,
+            bake_texture=bake_texture,
+            mc_resolution=mc_resolution
+        )
+        
+        logger.info(f"Fallback generator completed: {assets}")
+        return True, f"Fallback mesh generation successful: {assets}"
+        
+    except Exception as e:
+        error_msg = f"Fallback generator failed: {type(e).__name__}: {e}"
+        logger.error(error_msg)
+        return False, error_msg
 
+def _collect_assets(jobdir: Path) -> dict:
+    logger.info(f"Collecting assets from: {jobdir}")
+    jd0 = jobdir / "0"
+    
+    # prefer post-processed mesh if present
+    mesh_post = jd0 / "mesh_post.obj"
+    mesh = jd0 / "mesh.obj"
+    mtl  = jd0 / "mesh.mtl"
+    albedo = jd0 / "albedo.png"
+    input_png = jd0 / "input.png"
+    
     assets = {
-        "mesh_obj": str(mesh_obj) if mesh_obj.exists() else None,
-        "mesh_mtl": str(mesh_mtl) if mesh_mtl.exists() else None,
+        "mesh_obj": str(mesh_post if mesh_post.exists() else (mesh if mesh.exists() else "")) or None,
+        "mesh_mtl": str(mtl) if mtl.exists() else None,
         "albedo_png": str(albedo) if albedo.exists() else None,
         "input_png": str(input_png) if input_png.exists() else None,
     }
+    
+    logger.info(f"Found assets: {assets}")
+    
+    # Log what files actually exist in the output directory
+    if jd0.exists():
+        actual_files = list(jd0.iterdir())
+        logger.info(f"Actual files in {jd0}: {[f.name for f in actual_files]}")
+    else:
+        logger.warning(f"Output directory {jd0} does not exist")
+    
+    return assets
 
-    success = bool(assets["mesh_obj"])
-    msg = "OK" if success else "TripoSR local: échec de génération (voir logs)."
-    return {
-        "success": success,
-        "message": msg,
-        "job_dir": str(out_dir),
-        "assets": assets,
-        "log_tail": _tail_text_file(log_file, n=120),
+@app.get("/health")
+def health():
+    health_info = {
+        "ok": True,
+        "artifacts": str(ART_DIR),
+        "micro_api": MICRO_URL,
+        "has_runpy": RUNPY.exists(),
+        "triposr_path": str(RUNPY),
+        "fallback_available": FALLBACK_AVAILABLE,
+        "strategies": [
+            "TripoSR Micro API (primary)",
+            "TripoSR CLI (secondary)", 
+            "Fallback Generator (tertiary)" if FALLBACK_AVAILABLE else "Fallback Generator (unavailable)"
+        ]
     }
+    logger.info(f"Health check: {health_info}")
+    return health_info
 
+def _add_generate_route(path: str):
+    @app.post(path)
+    def generate(
+        file: UploadFile = File(...),
+        bake_texture: bool = Form(True),
+        texture_resolution: int = Form(1024),
+        mc_resolution: int = Form(384),
+        supersample: int = Form(1),
+    ):
+        logger.info(f"=== GENERATION REQUEST STARTED ===")
+        logger.info(f"Parameters: bake_texture={bake_texture}, texture_res={texture_resolution}, mc_res={mc_resolution}, supersample={supersample}")
+        
+        t0 = time.time()
+        jobdir = _now_jobdir()
+        job0 = jobdir / "0"
+        input_png = job0 / "input.png"
 
-# -----------------------------------------------------------------------------
-# Endpoints
-# -----------------------------------------------------------------------------
-@APP.get("/health")
-def health() -> JSONResponse:
-    api_up = _api_available()
-    triposr_run_py = (TRIPOSR_REPO / "run.py").is_file()
-    payload = {
-        "service": "fashion3d-api-piste-b",
-        "artifacts_dir": str(ART_DIR),
-        "triposr_api_url": TRIPOSR_API,
-        "triposr_api_up": api_up,
-        "triposr_repo": str(TRIPOSR_REPO),
-        "triposr_run_py": triposr_run_py,
-    }
-    return JSONResponse({"ready": True, **payload}, status_code=200)
-
-
-@APP.post("/generate", response_model=GenerateResponse)
-def generate(
-    file: UploadFile = File(..., description="Image d'entrée (fond transparent idéalement)"),
-    bake_texture: bool = Form(True),
-    texture_resolution: int = Form(1024),
-    mc_resolution: int = Form(256),
-) -> JSONResponse:
-    """
-    Prend une image et produit un mesh 3D (OBJ/MTL + texture si disponible).
-    """
-    # 1) Sauvegarde temporaire
-    tmp_dir = Path(tempfile.mkdtemp(prefix="fashion3d_"))
-    job_root = _job_dir(ART_DIR)
-    try:
-        # Valider les paramètres
-        if texture_resolution not in (256, 512, 1024, 2048, 4096):
-            raise HTTPException(status_code=400, detail="texture_resolution invalide (256/512/1024/2048/4096).")
-        if not (32 <= mc_resolution <= 512):
-            raise HTTPException(status_code=400, detail="mc_resolution doit être entre 32 et 512.")
-
-        # Enregistrer le fichier
-        suffix = Path(file.filename or "image").suffix or ".png"
-        img_path = tmp_dir / f"input{suffix}"
-        with img_path.open("wb") as f:
-            shutil.copyfileobj(file.file, f)
-
-        # 2) Essayer l'API TripoSR si dispo
-        if _api_available():
-            try:
-                resp = _call_triposr_api(img_path, bake_texture, texture_resolution, mc_resolution)
-                # On renvoie la réponse brute de TripoSR API si elle contient success
-                if isinstance(resp, dict) and "success" in resp:
-                    return JSONResponse(resp, status_code=200 if resp.get("success") else 500)
-            except Exception as e:
-                # Passer au fallback local si l'API échoue
-                pass
-
-        # 3) Fallback: exécution locale
-        resp = _run_triposr_local(img_path, bake_texture, texture_resolution, mc_resolution, job_root)
-        return JSONResponse(resp, status_code=200 if resp.get("success") else 500)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        return JSONResponse(
-            {
-                "success": False,
-                "message": f"Erreur serveur: {e}",
-                "job_dir": str(job_root),
-                "assets": {},
-            },
-            status_code=500,
-        )
-    finally:
-        # Nettoyage temp
+        # 1) persist upload
         try:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        except Exception:
-            pass
+            _save_upload_to_png(file, input_png)
+        except Exception as e:
+            logger.error(f"Failed to save upload: {e}")
+            raise
 
+        # 2) try micro-API first
+        logger.info("=== STRATEGY 1: TRYING MICRO API ===")
+        ok_micro, payload = _try_micro_api(
+            input_png, bake_texture, texture_resolution, mc_resolution, supersample
+        )
+        
+        if ok_micro and isinstance(payload, dict) and payload.get("success", payload.get("ok")):
+            logger.info("Micro API succeeded")
+            result = {
+                "ok": True,
+                "elapsed_sec": round(time.time() - t0, 3),
+                "job_dir": payload.get("job_dir"),
+                "assets": payload.get("assets", {}),
+                "note": "served by micro-api",
+                "log_tail": payload.get("log_tail", [])[-50:],
+            }
+            logger.info(f"=== GENERATION COMPLETED (MICRO API) ===")
+            return JSONResponse(result)
 
-# -----------------------------------------------------------------------------
-# Démarrage local: uvicorn api.server:app --host 0.0.0.0 --port 8001 --reload
-# -----------------------------------------------------------------------------
+        # 3) fallback CLI
+        logger.info("=== STRATEGY 2: TRYING CLI FALLBACK ===")
+        ok_cli, log_cli = _run_cli(
+            input_png, jobdir, bake_texture, texture_resolution, mc_resolution
+        )
+        
+        if ok_cli:
+            assets = _collect_assets(jobdir)
+            if assets.get("mesh_obj"):  # Check if we actually got a mesh
+                result = {
+                    "ok": True,
+                    "elapsed_sec": round(time.time() - t0, 3),
+                    "job_dir": str(jobdir),
+                    "assets": assets,
+                    "note": "served by fallback CLI",
+                    "log_tail": log_cli.splitlines()[-100:],
+                }
+                logger.info(f"=== GENERATION COMPLETED (CLI) ===")
+                return JSONResponse(result)
+        
+        # 4) Custom fallback generator
+        logger.info("=== STRATEGY 3: TRYING CUSTOM FALLBACK GENERATOR ===")
+        ok_fallback, log_fallback = _run_fallback_generator(
+            input_png, jobdir, bake_texture, texture_resolution, mc_resolution
+        )
+        
+        assets = _collect_assets(jobdir)
+        
+        result = {
+            "ok": ok_fallback,
+            "elapsed_sec": round(time.time() - t0, 3),
+            "job_dir": str(jobdir),
+            "assets": assets,
+            "note": "served by custom fallback generator" if ok_fallback else "all strategies failed",
+            "log_tail": log_fallback.splitlines()[-50:] if ok_fallback else [],
+            "error_summary": {
+                "micro_api": payload if not ok_micro else None,
+                "cli": log_cli if not ok_cli else None,
+                "fallback": log_fallback if not ok_fallback else None
+            }
+        }
+        
+        logger.info(f"=== GENERATION COMPLETED ({'SUCCESS' if ok_fallback else 'FAILED'}) ===")
+        return JSONResponse(result)
+
+# register both endpoints
+_add_generate_route("/generate")
+_add_generate_route("/generate/")

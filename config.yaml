@@ -1,8 +1,14 @@
-# Configuration Fashion3D API (Piste B)
-artifacts_dir: ./outputs
+artifacts_dir: outputs
 
-# URL de l'API TripoSR si elle tourne déjà (api_triposr.py)
-triposr_api: "http://127.0.0.1:8001"
+model_config:
+  voxel_resolution: 384     # marching cubes resolution
+  input_resolution: 1024    # single int (server.py expects an int)
 
-# Emplacement du repo TripoSR pour le fallback local
-triposr_repo: "~/TripoSR"
+preprocess:
+  blur_ksize: 0
+  dilate_iter: 0
+
+postprocess:
+  decimate_ratio: 0.0
+  smooth_iter: 0
+  close_holes: false
